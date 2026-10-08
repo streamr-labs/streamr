@@ -4,7 +4,7 @@ import { Button, Text, Modal, Icon } from "@stellar/design-system";
 import { useWallet } from "../hooks/useWallet";
 import { useWalletBalance } from "../hooks/useWalletBalance";
 import { Box } from "./layout/Box";
-// CSS imported in main.tsx after Stellar CSS to ensure overrides work
+// Modal styles are injected at runtime to ensure they override Stellar CSS.
 
 export const WalletButton = () => {
   const [showDisconnectModal, setShowDisconnectModal] = useState(false);
