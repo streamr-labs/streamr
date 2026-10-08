@@ -1,9 +1,9 @@
+/// <reference types="vitest" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import wasm from "vite-plugin-wasm";
 import { nodePolyfills } from "vite-plugin-node-polyfills";
 
-// https://vite.dev/config/
 const repoName =
   process.env.GITHUB_ACTIONS === "true"
     ? process.env.GITHUB_REPOSITORY?.split("/")[1] ?? ""
@@ -42,6 +42,11 @@ export default defineConfig(() => {
           changeOrigin: true,
         },
       },
+    },
+    test: {
+      globals: true,
+      environment: "jsdom",
+      setupFiles: "./vitest.setup.ts",
     },
   };
 });
