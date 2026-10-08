@@ -40,62 +40,99 @@ export interface FormattedStream extends Stream {
 /**
  * Hook for fetching and managing payment streams
  */
+
+export const unwrapOptionalText = (value: any): string | null => {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed : null;
+  }
+  if (typeof value === "object") {
+    if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) {
+      const decoded = value.toString("utf-8").trim();
+      return decoded.length ? decoded : null;
+    }
+    if (typeof value._value === "object" && value._value?.type === "Buffer" && Array.isArray(value._value?.data)) {
+      const bytes = Uint8Array.from(value._value.data);
+      let decoded = "";
+      if (typeof Buffer !== "undefined") {
+        decoded = Buffer.from(bytes).toString("utf-8").trim();
+      } else if (typeof TextDecoder !== "undefined") {
+        decoded = new TextDecoder("utf-8").decode(bytes).trim();
+      }
+      return decoded.length ? decoded : null;
+    }
+    if ("some" in value) return unwrapOptionalText(value.some);
+    if ("value" in value) return unwrapOptionalText(value.value);
+    if ("str" in value) return unwrapOptionalText(value.str);
+    if (Array.isArray(value)) {
+      if (value.length === 0) return null;
+      return unwrapOptionalText(value[0]);
+    }
+    if (typeof value.toString === "function") {
+      const asString = value.toString();
+      if (asString && asString !== "[object Object]") {
+        return unwrapOptionalText(asString);
+      }
+    }
+  }
+  const fallback = String(value ?? "").trim();
+  return fallback.length ? fallback : null;
+};
+
+export const unwrapAddress = (value: unknown): string => {
+  if (!value) return "";
+  const asString = String(value).trim();
+  if (asString.startsWith("\"") && asString.endsWith("\"")) {
+    return asString.slice(1, -1);
+  }
+  return asString;
+};
+
+export const mapRawStream = (stream: any): Stream | null => {
+  if (!stream) return null;
+  const id = Number(stream.id?.toString?.() ?? stream.id);
+  if (Number.isNaN(id)) return null;
+
+  const recipientsArray: string[] = Array.isArray(stream.recipients)
+    ? stream.recipients.map(unwrapAddress)
+    : [];
+  const primaryRecipient =
+    recipientsArray.length > 0 ? recipientsArray[0] : unwrapAddress(stream.recipient || "");
+
+  const rate = stream.rate_per_second?.toString?.() ?? stream.rate_per_second ?? "0";
+  const deposit = stream.deposit?.toString?.() ?? stream.deposit ?? "0";
+  const startTime = stream.start_time?.toString?.() ?? stream.start_time ?? "0";
+  const lastWithdrawTime = stream.last_withdraw_time?.toString?.() ?? stream.last_withdraw_time ?? "0";
+
+  return {
+    id,
+    sender: unwrapAddress(stream.sender || ""),
+    recipient: primaryRecipient,
+    recipients: recipientsArray,
+    token_contract: stream.token_contract || "",
+    rate_per_second: BigInt(rate || "0"),
+    deposit: BigInt(deposit || "0"),
+    start_time: BigInt(startTime || "0"),
+    last_withdraw_time: BigInt(lastWithdrawTime || "0"),
+    is_active: Boolean(stream.is_active),
+    title: unwrapOptionalText(stream.title),
+    description: unwrapOptionalText(stream.description),
+  };
+};
+
 export const useStreams = () => {
   const { address } = useWallet();
   const { getContractClient, executeContractMethod } = useStreamerContract();
   const queryClient = useQueryClient();
   const { addNotification } = useNotification();
 
-  const unwrapOptionalText = useCallback((value: any): string | null => {
-    if (value === undefined || value === null) return null;
-    if (typeof value === "string") {
-      const trimmed = value.trim();
-      return trimmed.length ? trimmed : null;
-    }
-    if (typeof value === "object") {
-      if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) {
-        const decoded = value.toString("utf-8").trim();
-        return decoded.length ? decoded : null;
-      }
-      if (typeof value._value === "object" && value._value?.type === "Buffer" && Array.isArray(value._value?.data)) {
-        const bytes = Uint8Array.from(value._value.data);
-        let decoded = "";
-        if (typeof Buffer !== "undefined") {
-          decoded = Buffer.from(bytes).toString("utf-8").trim();
-        } else if (typeof TextDecoder !== "undefined") {
-          decoded = new TextDecoder("utf-8").decode(bytes).trim();
-        }
-        return decoded.length ? decoded : null;
-      }
-      if ("some" in value) return unwrapOptionalText(value.some);
-      if ("value" in value) return unwrapOptionalText(value.value);
-      if ("str" in value) return unwrapOptionalText(value.str);
-      if (Array.isArray(value)) {
-        if (value.length === 0) return null;
-        return unwrapOptionalText(value[0]);
-      }
-      if (typeof value.toString === "function") {
-        const asString = value.toString();
-        if (asString && asString !== "[object Object]") {
-          return unwrapOptionalText(asString);
-        }
-      }
-    }
-    const fallback = String(value ?? "").trim();
-    return fallback.length ? fallback : null;
-  }, []);
+  
 
   /**
    * Calculate withdrawable amount for a stream
    */
-  const unwrapAddress = useCallback((value: unknown): string => {
-    if (!value) return "";
-    const asString = String(value).trim();
-    if (asString.startsWith("\"") && asString.endsWith("\"")) {
-      return asString.slice(1, -1);
-    }
-    return asString;
-  }, []);
+  
 
   const calculateWithdrawableAmount = useCallback(
     (stream: Stream, currentTime: bigint): bigint => {
@@ -181,46 +218,13 @@ export const useStreams = () => {
         recipients: normalizedRecipients,
       };
     },
-    [calculateTotalStreamed, calculateWithdrawableAmount, unwrapAddress]
+    [calculateTotalStreamed, calculateWithdrawableAmount]
   );
 
   /**
    * Normalize raw stream data to the Stream interface
    */
-  const mapRawStream = useCallback(
-    (stream: any): Stream | null => {
-      if (!stream) return null;
-      const id = Number(stream.id?.toString?.() ?? stream.id);
-      if (Number.isNaN(id)) return null;
-
-      const recipientsArray: string[] = Array.isArray(stream.recipients)
-        ? stream.recipients.map(unwrapAddress)
-        : [];
-      const primaryRecipient =
-        recipientsArray.length > 0 ? recipientsArray[0] : unwrapAddress(stream.recipient || "");
-
-      const rate = stream.rate_per_second?.toString?.() ?? stream.rate_per_second ?? "0";
-      const deposit = stream.deposit?.toString?.() ?? stream.deposit ?? "0";
-      const startTime = stream.start_time?.toString?.() ?? stream.start_time ?? "0";
-      const lastWithdrawTime = stream.last_withdraw_time?.toString?.() ?? stream.last_withdraw_time ?? "0";
-
-      return {
-        id,
-        sender: unwrapAddress(stream.sender || ""),
-        recipient: primaryRecipient,
-        recipients: recipientsArray,
-        token_contract: stream.token_contract || "",
-        rate_per_second: BigInt(rate || "0"),
-        deposit: BigInt(deposit || "0"),
-        start_time: BigInt(startTime || "0"),
-        last_withdraw_time: BigInt(lastWithdrawTime || "0"),
-        is_active: Boolean(stream.is_active),
-        title: unwrapOptionalText(stream.title),
-        description: unwrapOptionalText(stream.description),
-      };
-    },
-    [unwrapOptionalText, unwrapAddress]
-  );
+  
 
   /**
    * Decode a stream returned as raw ScVal when generated bindings fail to parse
