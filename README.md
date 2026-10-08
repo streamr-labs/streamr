@@ -65,11 +65,10 @@ Before you begin, make sure you have the following installed:
 | Tool | Description | Install Link |
 |------|-------------|--------------|
 | Rust & Cargo | For writing and compiling smart contracts | `curl https://sh.rustup.rs -sSf | sh` |
-| Node.js & npm | For frontend development | Download from official site |
-| Stellar CLI | For building, deploying, and interacting with smart contracts | Link for the repo |
-| Docker | For running a Stellar node locally | Download from official site |
+| Node.js & npm | For frontend development | [https://nodejs.org/](https://nodejs.org/) |
+| Stellar CLI | For building, deploying, and interacting with smart contracts | [https://developers.stellar.org/docs/tools/developer-tools/cli/stellar-cli](https://developers.stellar.org/docs/tools/developer-tools/cli/stellar-cli) |
+| Docker | For running a Stellar node locally | [https://docs.docker.com/get-docker/](https://docs.docker.com/get-docker/) |
 
-For Windows users, please refer to the additional setup instructions here.
 
 ## Quickstart (New Developers Welcome!)
 
