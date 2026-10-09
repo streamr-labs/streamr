@@ -24,6 +24,58 @@ fn normalize_optional_text(input: Option<String>, max_len: u32) -> Option<String
     }
 }
 
+/// Sum of every recipient's per-second rate (the stream's combined outflow).
+fn total_outflow_rate(stream: &Stream) -> i128 {
+    let mut total: i128 = 0i128;
+    for i in 0..stream.recipients.len() {
+        let r = stream.recipients.get(i).unwrap();
+        let ri = stream.recipient_rate_per_second.get(r).unwrap_or(0i128);
+        total = total.saturating_add(ri);
+    }
+    total
+}
+
+/// The most a recipient can ever receive from the deposit: their pro-rata share of it,
+/// `deposit * rate / total_rate`. This is exactly what the recipient would have streamed
+/// by the time the deposit is used up at the combined rate, so the shares of all
+/// recipients add up to at most `deposit` (integer division rounds each share down).
+fn recipient_share_cap(deposit: i128, rate: i128, total_rate: i128) -> i128 {
+    if deposit <= 0 || rate <= 0 || total_rate <= 0 {
+        return 0i128;
+    }
+    match deposit.checked_mul(rate) {
+        Some(product) => product / total_rate,
+        // `deposit * rate` does not fit in an i128: divide first. This still rounds
+        // down, so the shares can never add up to more than the deposit.
+        None => (deposit / total_rate).saturating_mul(rate),
+    }
+}
+
+/// Amount `recipient` can withdraw right now.
+///
+/// A recipient accrues `rate * elapsed` since the stream started, bounded by their share
+/// of the deposit (see `recipient_share_cap`), minus what they have already withdrawn.
+/// Capping each recipient by their own share, and not by a deposit remainder shared with
+/// everyone else, keeps the total paid out within `deposit` for any withdrawal order and
+/// never leaves a recipient's accrued funds stranded behind another recipient's accrual.
+fn withdrawable_now(stream: &Stream, recipient: &Address, now: u64) -> i128 {
+    let rate = stream
+        .recipient_rate_per_second
+        .get(recipient.clone())
+        .unwrap_or(0i128);
+    if rate <= 0i128 {
+        return 0i128;
+    }
+    let share_cap = recipient_share_cap(stream.deposit, rate, total_outflow_rate(stream));
+    let elapsed = now.saturating_sub(stream.start_time) as i128;
+    let vested = core::cmp::min(elapsed.saturating_mul(rate), share_cap);
+    let withdrawn = stream
+        .recipient_total_withdrawn
+        .get(recipient.clone())
+        .unwrap_or(0i128);
+    core::cmp::max(vested.saturating_sub(withdrawn), 0i128)
+}
+
 /// Error codes
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -318,7 +370,7 @@ impl Streamer {
             return 0i128;
         }
 
-        // Calculate this recipient's accrued amount using their individual rate
+        // This recipient must have a positive rate
         let rate_i = stream
             .recipient_rate_per_second
             .get(recipient.clone())
@@ -326,25 +378,11 @@ impl Streamer {
         if rate_i <= 0i128 {
             panic!();
         }
-        let elapsed = (now - last_withdraw) as i128;
-        let recipient_accrued = elapsed.saturating_mul(rate_i);
 
-        // Calculate total distributed across ALL recipients
-        // Total outflow rate = sum of per-recipient rates
-        let mut total_outflow_rate: i128 = 0i128;
-        for i in 0..stream.recipients.len() {
-            let r = stream.recipients.get(i).unwrap();
-            let ri = stream.recipient_rate_per_second.get(r).unwrap_or(0i128);
-            total_outflow_rate = total_outflow_rate.saturating_add(ri);
-        }
-        let total_elapsed_from_start = (now - stream.start_time) as i128;
-        let total_distributed = total_elapsed_from_start.saturating_mul(total_outflow_rate);
-        let remaining_deposit = stream.deposit.saturating_sub(total_distributed);
-
-        // Calculate how much this recipient can withdraw
-        // We need to ensure we don't exceed the remaining deposit
-        // Since each recipient gets the full rate, we need to check if there's enough for this withdrawal
-        let transfer_amount = core::cmp::min(recipient_accrued, remaining_deposit);
+        // What this recipient has accrued so far (bounded by their own share of the
+        // deposit) minus what they already withdrew. Other recipients' withdrawals do not
+        // affect it, so the sum of all payouts can never exceed the deposit.
+        let transfer_amount = withdrawable_now(&stream, &recipient, now);
 
         if transfer_amount <= 0 {
             panic!(); // Nothing to withdraw
@@ -369,10 +407,24 @@ impl Streamer {
             .recipient_total_withdrawn
             .set(recipient.clone(), new_total);
 
-        // Check if deposit is exhausted (all remaining would be distributed)
-        // Calculate new remaining after this withdrawal
-        let new_remaining = remaining_deposit.saturating_sub(transfer_amount);
-        if new_remaining <= 0 {
+        // The stream is finished once every recipient has received their full share of the
+        // deposit. Until then it stays open so the others can still claim theirs.
+        let total_rate = total_outflow_rate(&stream);
+        let mut all_paid = true;
+        for i in 0..stream.recipients.len() {
+            let r = stream.recipients.get(i).unwrap();
+            let ri = stream
+                .recipient_rate_per_second
+                .get(r.clone())
+                .unwrap_or(0i128);
+            let share = recipient_share_cap(stream.deposit, ri, total_rate);
+            let paid = stream.recipient_total_withdrawn.get(r).unwrap_or(0i128);
+            if paid < share {
+                all_paid = false;
+                break;
+            }
+        }
+        if all_paid {
             stream.is_active = false;
         }
 
@@ -710,34 +762,14 @@ impl Streamer {
             .get(recipient.clone())
             .unwrap_or(stream.start_time);
 
-        // Calculate current accrued (not yet withdrawn) using per-recipient rate
-        let rate_i = stream
-            .recipient_rate_per_second
-            .get(recipient.clone())
-            .unwrap_or(0i128);
-        let elapsed = (now - last_withdraw) as i128;
-        let current_accrued = elapsed.saturating_mul(rate_i);
-
-        // Cap accrued by remaining deposit
-        // Total outflow rate = sum of per-recipient rates
-        let mut total_outflow_rate: i128 = 0i128;
-        for i in 0..stream.recipients.len() {
-            let r = stream.recipients.get(i).unwrap();
-            let ri = stream.recipient_rate_per_second.get(r).unwrap_or(0i128);
-            total_outflow_rate = total_outflow_rate.saturating_add(ri);
-        }
-        let total_elapsed_from_start = (now - stream.start_time) as i128;
-        let total_distributed = total_elapsed_from_start.saturating_mul(total_outflow_rate);
-        let remaining_deposit = stream.deposit.saturating_sub(total_distributed);
-
-        // Limit accrued by available deposit (if remaining is negative, cap at 0)
-        let capped_accrued = if remaining_deposit > 0 {
-            core::cmp::min(current_accrued, remaining_deposit)
+        // Amount a withdrawal would pay right now (same calculation as `withdraw_stream`)
+        let current_accrued = if stream.is_active {
+            withdrawable_now(&stream, &recipient, now)
         } else {
             0i128
         };
 
-        (total_withdrawn, capped_accrued, last_withdraw)
+        (total_withdrawn, current_accrued, last_withdraw)
     }
 
     /// Get information about all recipients in a stream.
@@ -752,17 +784,6 @@ impl Streamer {
         let mut result = Vec::new(&env);
         let now = env.ledger().timestamp();
 
-        // Calculate remaining deposit for all recipients (sum of per-recipient rates)
-        let mut total_outflow_rate: i128 = 0i128;
-        for i in 0..stream.recipients.len() {
-            let r = stream.recipients.get(i).unwrap();
-            let ri = stream.recipient_rate_per_second.get(r).unwrap_or(0i128);
-            total_outflow_rate = total_outflow_rate.saturating_add(ri);
-        }
-        let total_elapsed_from_start = (now - stream.start_time) as i128;
-        let total_distributed = total_elapsed_from_start.saturating_mul(total_outflow_rate);
-        let remaining_deposit = stream.deposit.saturating_sub(total_distributed);
-
         for i in 0..stream.recipients.len() {
             let recipient = stream.recipients.get(i).unwrap();
 
@@ -776,16 +797,9 @@ impl Streamer {
                 .get(recipient.clone())
                 .unwrap_or(stream.start_time);
 
-            let elapsed = (now - last_withdraw) as i128;
-            let rate_i = stream
-                .recipient_rate_per_second
-                .get(recipient.clone())
-                .unwrap_or(0i128);
-            let current_accrued = elapsed.saturating_mul(rate_i);
-
-            // Cap accrued by remaining deposit (if remaining is negative, cap at 0)
-            let capped_accrued = if remaining_deposit > 0 {
-                core::cmp::min(current_accrued, remaining_deposit)
+            // Amount a withdrawal would pay right now (same calculation as `withdraw_stream`)
+            let current_accrued = if stream.is_active {
+                withdrawable_now(&stream, &recipient, now)
             } else {
                 0i128
             };
@@ -793,7 +807,7 @@ impl Streamer {
             result.push_back((
                 recipient.clone(),
                 total_withdrawn,
-                capped_accrued,
+                current_accrued,
                 last_withdraw,
             ));
         }
@@ -1025,5 +1039,245 @@ impl Streamer {
         env.storage()
             .persistent()
             .set(&DataKey::TokenContract, &token);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    extern crate std;
+
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::token::StellarAssetClient;
+
+    const START: u64 = 1_000;
+
+    /// Test fixture: a stellar-asset token, a funded sender and a deployed `Streamer`.
+    struct Fixture {
+        env: Env,
+        streamer: Address,
+        token: Address,
+        sender: Address,
+    }
+
+    impl Fixture {
+        fn new(sender_funds: i128) -> Self {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.ledger().with_mut(|l| l.timestamp = START);
+
+            let token = env
+                .register_stellar_asset_contract_v2(Address::generate(&env))
+                .address();
+            let sender = Address::generate(&env);
+            StellarAssetClient::new(&env, &token).mint(&sender, &sender_funds);
+            let streamer = env.register(Streamer, ());
+
+            Fixture {
+                env,
+                streamer,
+                token,
+                sender,
+            }
+        }
+
+        fn client(&self) -> StreamerClient<'_> {
+            StreamerClient::new(&self.env, &self.streamer)
+        }
+
+        fn balance(&self, who: &Address) -> i128 {
+            TokenClient::new(&self.env, &self.token).balance(who)
+        }
+
+        fn at(&self, seconds_after_start: u64) {
+            self.env
+                .ledger()
+                .with_mut(|l| l.timestamp = START + seconds_after_start);
+        }
+
+        /// Opens a stream in which recipient `i` streams `rates[i]` tokens per second
+        /// (period of 100 seconds, so `amount_per_period = rate * 100`).
+        fn open(&self, recipients: &[Address], rates: &[i128], deposit: i128) -> u32 {
+            let mut who = Vec::new(&self.env);
+            let mut amounts = Vec::new(&self.env);
+            for (r, rate) in recipients.iter().zip(rates.iter()) {
+                who.push_back(r.clone());
+                amounts.push_back(rate * 100);
+            }
+            self.client().create_stream(
+                &self.sender,
+                &who,
+                &self.token,
+                &amounts,
+                &100u64,
+                &deposit,
+                &None,
+                &None,
+            )
+        }
+    }
+
+    #[test]
+    fn single_recipient_gets_the_accrued_amount_mid_stream() {
+        let f = Fixture::new(1_000);
+        let alice = Address::generate(&f.env);
+        let id = f.open(core::slice::from_ref(&alice), &[1], 100);
+
+        f.at(10);
+        assert_eq!(f.client().withdraw_stream(&id, &alice), 10);
+        assert_eq!(f.balance(&alice), 10);
+    }
+
+    #[test]
+    fn single_recipient_can_claim_the_whole_deposit_after_it_is_exhausted() {
+        let f = Fixture::new(1_000);
+        let alice = Address::generate(&f.env);
+        let id = f.open(core::slice::from_ref(&alice), &[1], 100);
+
+        // The deposit runs out at t = 100; waiting longer must not strand the funds.
+        f.at(250);
+        assert_eq!(f.client().withdraw_stream(&id, &alice), 100);
+        assert_eq!(f.balance(&alice), 100);
+        assert_eq!(f.balance(&f.streamer), 0);
+        assert!(!f.client().get_stream(&id).is_active);
+    }
+
+    #[test]
+    fn single_recipient_is_paid_in_full_across_several_withdrawals() {
+        let f = Fixture::new(1_000);
+        let alice = Address::generate(&f.env);
+        let id = f.open(core::slice::from_ref(&alice), &[1], 100);
+
+        f.at(10);
+        assert_eq!(f.client().withdraw_stream(&id, &alice), 10);
+        f.at(60);
+        assert_eq!(f.client().withdraw_stream(&id, &alice), 50);
+        f.at(200);
+        assert_eq!(f.client().withdraw_stream(&id, &alice), 40);
+        assert_eq!(f.balance(&alice), 100);
+        assert_eq!(f.balance(&f.streamer), 0);
+    }
+
+    #[test]
+    fn two_recipients_never_withdraw_more_than_the_deposit() {
+        let f = Fixture::new(1_000);
+        let alice = Address::generate(&f.env);
+        let bob = Address::generate(&f.env);
+        // Combined outflow is 2 / s, so the 100 token deposit lasts 50 seconds.
+        let id = f.open(&[alice.clone(), bob.clone()], &[1, 1], 100);
+
+        f.at(30);
+        assert_eq!(f.client().withdraw_stream(&id, &alice), 30);
+        assert_eq!(f.client().withdraw_stream(&id, &bob), 30);
+
+        f.at(1_000);
+        assert_eq!(f.client().withdraw_stream(&id, &alice), 20);
+        assert_eq!(f.client().withdraw_stream(&id, &bob), 20);
+
+        assert_eq!(f.balance(&alice) + f.balance(&bob), 100);
+        assert_eq!(f.balance(&f.streamer), 0);
+        // Nothing is left to claim.
+        assert!(f.client().try_withdraw_stream(&id, &alice).is_err());
+    }
+
+    #[test]
+    fn withdrawal_order_does_not_change_what_each_recipient_receives() {
+        let f = Fixture::new(1_000);
+        let alice = Address::generate(&f.env);
+        let bob = Address::generate(&f.env);
+        // Rates 3 : 1 on a 100 token deposit: Alice's share is 75 and Bob's is 25.
+        let id = f.open(&[alice.clone(), bob.clone()], &[3, 1], 100);
+
+        f.at(500);
+        // Bob withdraws first, then Alice: neither may starve the other.
+        assert_eq!(f.client().withdraw_stream(&id, &bob), 25);
+        assert_eq!(f.client().withdraw_stream(&id, &alice), 75);
+        assert_eq!(f.balance(&f.streamer), 0);
+    }
+
+    #[test]
+    fn early_withdrawals_do_not_shrink_what_is_owed_later() {
+        let f = Fixture::new(1_000);
+        let alice = Address::generate(&f.env);
+        let bob = Address::generate(&f.env);
+        let id = f.open(&[alice.clone(), bob.clone()], &[1, 1], 100);
+
+        // Alice drains early and often; Bob waits until the end.
+        for t in [10u64, 20, 30, 40, 50] {
+            f.at(t);
+            f.client().withdraw_stream(&id, &alice);
+        }
+        f.at(60);
+        assert_eq!(f.balance(&alice), 50);
+        assert_eq!(f.client().withdraw_stream(&id, &bob), 50);
+        assert_eq!(f.balance(&f.streamer), 0);
+    }
+
+    #[test]
+    fn rounding_dust_stays_in_the_contract_and_total_never_exceeds_the_deposit() {
+        let f = Fixture::new(1_000);
+        let a = Address::generate(&f.env);
+        let b = Address::generate(&f.env);
+        let c = Address::generate(&f.env);
+        // 100 / 3 does not divide evenly: each share is floored to 33.
+        let id = f.open(&[a.clone(), b.clone(), c.clone()], &[1, 1, 1], 100);
+
+        f.at(10_000);
+        let paid = f.client().withdraw_stream(&id, &a)
+            + f.client().withdraw_stream(&id, &b)
+            + f.client().withdraw_stream(&id, &c);
+        assert_eq!(paid, 99);
+        assert!(paid <= 100);
+        assert_eq!(f.balance(&f.streamer), 1);
+        assert!(!f.client().get_stream(&id).is_active);
+    }
+
+    #[test]
+    fn stream_stays_active_until_every_recipient_has_been_paid() {
+        let f = Fixture::new(1_000);
+        let alice = Address::generate(&f.env);
+        let bob = Address::generate(&f.env);
+        let id = f.open(&[alice.clone(), bob.clone()], &[1, 1], 100);
+
+        f.at(1_000);
+        f.client().withdraw_stream(&id, &alice);
+        // Bob has not claimed yet, so the stream must remain open for him.
+        assert!(f.client().get_stream(&id).is_active);
+        assert_eq!(f.client().withdraw_stream(&id, &bob), 50);
+        assert!(!f.client().get_stream(&id).is_active);
+    }
+
+    #[test]
+    fn recipient_info_reports_what_a_withdrawal_would_actually_pay() {
+        let f = Fixture::new(1_000);
+        let alice = Address::generate(&f.env);
+        let bob = Address::generate(&f.env);
+        let id = f.open(&[alice.clone(), bob.clone()], &[1, 1], 100);
+
+        f.at(40);
+        let (withdrawn, accrued, _) = f.client().get_recipient_info(&id, &alice);
+        assert_eq!((withdrawn, accrued), (0, 40));
+
+        f.at(500);
+        let (_, accrued, _) = f.client().get_recipient_info(&id, &alice);
+        assert_eq!(accrued, 50);
+        assert_eq!(f.client().withdraw_stream(&id, &alice), accrued);
+
+        // The bulk view agrees with the per-recipient view.
+        let all = f.client().get_all_recipients_info(&id);
+        let (who, withdrawn, accrued, _) = all.get(1).unwrap();
+        assert_eq!((who, withdrawn, accrued), (bob, 0, 50));
+    }
+
+    #[test]
+    fn non_recipient_cannot_withdraw() {
+        let f = Fixture::new(1_000);
+        let alice = Address::generate(&f.env);
+        let mallory = Address::generate(&f.env);
+        let id = f.open(&[alice], &[1], 100);
+
+        f.at(50);
+        assert!(f.client().try_withdraw_stream(&id, &mallory).is_err());
+        assert_eq!(f.balance(&mallory), 0);
     }
 }
