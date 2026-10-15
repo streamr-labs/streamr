@@ -43,6 +43,8 @@ jobs:
             echo "stellar-scaffold already installed. Clear cache to force reinstall."
           fi
       - run: npm ci
+      - name: Check .env.example matches frontend schema
+        run: node scripts/check-env-example.mjs
       - run: npm run lint
       - run: npx prettier . --check
       - name: Build clients before building the project
