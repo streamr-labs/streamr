@@ -277,6 +277,13 @@ We love contributions! If you're new, check these out:
 
 - [Contributing Guide](CONTRIBUTING.md)
 
+### GitHub Pages Release Control (`github-pages` Environment)
+
+Production deployments in `.github/workflows/deploy-gh-pages.yml` are gated behind the protected `github-pages` GitHub Actions environment (declared in `.github/environments/github-pages.json`):
+
+- **Least-privilege permissions:** Workflow-level permissions are restricted to `contents: read`; `pages: write` and `id-token: write` are scoped exclusively to the `deploy` job (`if: github.ref == 'refs/heads/main'`).
+- **Required reviewers & branch policy:** Under **Settings → Environments → `github-pages`**, configure **Required reviewers** and restrict **Deployment branches** to `main` so that pushes to `main` or manual `workflow_dispatch` runs pause for approval before `actions/deploy-pages` publishes.
+
 ## License
 
 This project is licensed under the Apache-2.0 License — see the LICENSE file for details.
