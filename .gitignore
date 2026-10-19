@@ -25,8 +25,6 @@ pnpm-debug.log*
 lerna-debug.log*
 
 # environment variables
-.env
-.env.*
 !.env.example
 
 # easy way to create temporary local-only files and folders
@@ -52,3 +50,4 @@ src/contracts/*
 branch_structure.json
 temp_auto_push.bat
 temp_interactive_push.bat
+config.bat
