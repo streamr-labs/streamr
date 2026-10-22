@@ -17,9 +17,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/cache@v3
         with:
+          # Cache ~/.cargo/bin/, Cargo registry/git indices, and target/ (compiled
+          # Soroban contract build artifacts and intermediate crates) across runs.
           path: |
             ~/.cargo/bin/
-            runner/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
